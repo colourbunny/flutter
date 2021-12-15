@@ -24,6 +24,7 @@ import 'utils.dart';
 final String flutterRoot = path.dirname(path.dirname(path.dirname(path.fromUri(Platform.script))));
 final String flutter = path.join(flutterRoot, 'bin', Platform.isWindows ? 'flutter.bat' : 'flutter');
 final String flutterPackages = path.join(flutterRoot, 'packages');
+final String flutterExamples = path.join(flutterRoot, 'examples');
 final String dart = path.join(flutterRoot, 'bin', 'cache', 'dart-sdk', 'bin', Platform.isWindows ? 'dart.exe' : 'dart');
 final String pub = path.join(flutterRoot, 'bin', 'cache', 'dart-sdk', 'bin', Platform.isWindows ? 'pub.bat' : 'pub');
 final String pubCache = path.join(flutterRoot, '.pub-cache');
@@ -50,6 +51,10 @@ Future<void> run(List<String> arguments) async {
   if (!assertsEnabled) {
     exitWithError(<String>['The analyze.dart script must be run with --enable-asserts.']);
   }
+
+  print('$clock No sync*/async*');
+  await verifyNoSyncAsyncStar(flutterPackages);
+  await verifyNoSyncAsyncStar(flutterExamples, minimumMatches: 200);
 
   print('$clock No runtimeType in toString...');
   await verifyNoRuntimeTypeInToString(flutterRoot);
@@ -92,6 +97,9 @@ Future<void> run(List<String> arguments) async {
 
   print('$clock Integration test timeouts...');
   await verifyIntegrationTestTimeouts(flutterRoot);
+
+  print('$clock null initialized debug fields...');
+  await verifyNullInitializedDebugExpensiveFields(flutterRoot);
 
   // Ensure that all package dependencies are in sync.
   print('$clock Package dependencies...');
@@ -152,6 +160,45 @@ Future<void> run(List<String> arguments) async {
 
 
 // TESTS
+
+Future<void> verifyNoSyncAsyncStar(String workingDirectory, {int minimumMatches = 2000 }) async {
+  final RegExp syncPattern = RegExp(r'\s*?a?sync\*\s*?{');
+  final RegExp ignorePattern = RegExp(r'^\s*?// The following uses a?sync\* because:? ');
+  final RegExp commentPattern = RegExp(r'^\s*?//');
+  final List<String> errors = <String>[];
+  await for (final File file in _allFiles(workingDirectory, 'dart', minimumMatches: minimumMatches)) {
+    if (file.path.contains('test')) {
+      continue;
+    }
+    final List<String> lines = file.readAsLinesSync();
+    for (int index = 0; index < lines.length; index += 1) {
+      final String line = lines[index];
+      if (line.startsWith(commentPattern)) {
+        continue;
+      }
+      if (line.contains(syncPattern)) {
+        int lookBehindIndex = index - 1;
+        bool hasExplanation = false;
+        while (lookBehindIndex >= 0 && lines[lookBehindIndex].startsWith(commentPattern)) {
+          if (lines[lookBehindIndex].startsWith(ignorePattern)) {
+            hasExplanation = true;
+            break;
+          }
+          lookBehindIndex -= 1;
+        }
+        if (!hasExplanation) {
+          errors.add('${file.path}:$index: sync*/async* without an explanation.');
+        }
+      }
+    }
+  }
+  if (errors.isNotEmpty) {
+    exitWithError(<String>[
+      '${bold}Do not use sync*/async* methods. See https://github.com/flutter/flutter/wiki/Style-guide-for-Flutter-repo#avoid-syncasync for details.$reset',
+      ...errors,
+    ]);
+  }
+}
 
 final RegExp _findGoldenTestPattern = RegExp(r'matchesGoldenFile\(');
 final RegExp _findGoldenDefinitionPattern = RegExp(r'matchesGoldenFile\(Object');
@@ -752,7 +799,7 @@ Future<void> verifyIssueLinks(String workingDirectory) async {
   final Set<String> suggestions = <String>{};
   final List<File> files = await _gitFiles(workingDirectory);
   for (final File file in files) {
-    if (path.basename(file.path).endsWith('_test.dart'))
+    if (path.basename(file.path).endsWith('_test.dart') || path.basename(file.path) == 'analyze.dart')
       continue; // Skip tests, they're not public-facing.
     final Uint8List bytes = file.readAsBytesSync();
     // We allow invalid UTF-8 here so that binaries don't trip us up.
@@ -1455,6 +1502,40 @@ Future<void> _checkConsumerDependencies() async {
       'To make sure we do not accidentally add ${plural(removed.length, "this dependency", "these dependencies")} back in the future,',
       'please remove ${plural(removed.length, "this", "these")} packages from the allow-list in dev/bots/allowlist.dart.',
       'Thanks!',
+    ]);
+  }
+}
+
+const String _kDebugOnlyAnnotation = '@_debugOnly';
+final RegExp _nullInitializedField = RegExp(r'kDebugMode \? [\w\<\> ,{}()]+ : null;');
+
+Future<void> verifyNullInitializedDebugExpensiveFields(String workingDirectory, {int minimumMatches = 400}) async {
+  final String flutterLib = path.join(workingDirectory, 'packages', 'flutter', 'lib');
+  final List<File> files = await _allFiles(flutterLib, 'dart', minimumMatches: minimumMatches)
+    .toList();
+  final List<String> errors = <String>[];
+  for (final File file in files) {
+    final List<String> lines = file.readAsLinesSync();
+    for (int i = 0; i < lines.length; i += 1) {
+      final String line = lines[i];
+      if (!line.contains(_kDebugOnlyAnnotation)) {
+        continue;
+      }
+      final String nextLine = lines[i + 1];
+      if (_nullInitializedField.firstMatch(nextLine) == null) {
+        errors.add('${file.path} L$i');
+      }
+    }
+  }
+
+  if (errors.isNotEmpty) {
+    exitWithError(<String>[
+     '${bold}ERROR: ${red}fields annotated with @_debugOnly must null initialize.$reset',
+     'to ensure both the field and initializer are removed from profile/release mode.',
+     'These fields should be written as:\n',
+     'field = kDebugMode ? <DebugValue> : null;\n',
+     'Errors were found in the following files:',
+      ...errors,
     ]);
   }
 }
